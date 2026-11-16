@@ -1,0 +1,69 @@
+# Nginx terminates TLS and proxies plaintext HTTP/WS to the Rust service.
+# The Rust process should bind 127.0.0.1:8080 (or an internal address), never
+# a public TLS socket.
+
+# Required for WebSocket upgrade. Put this in the http {} block.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Do not write the query string to access logs: /ws?access_token=... contains a
+# bearer-equivalent secret.
+log_format onebot_no_query '$remote_addr - $remote_user [$time_local] '
+                           '"$request_method $uri $server_protocol" $status '
+                           '$body_bytes_sent "$http_referer" '
+                           '"$http_user_agent"';
+
+server {
+    listen 80;
+    server_name chat.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name chat.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/chat.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/chat.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/onebot.access.log onebot_no_query;
+    error_log  /var/log/nginx/onebot.error.log warn;
+
+    # Segment arrays / larger message payloads.
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        # WebSocket upgrade passthrough.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # Origin / URL derivation for /register.
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # Do not buffer WS frames.
+        proxy_buffering off;
+
+        # The Rust prototype enables permissive CORS so the single-file client
+        # can also be opened from file://. If you only serve /client from this
+        # same origin, you can hide that header at the edge:
+        # proxy_hide_header Access-Control-Allow-Origin;
+
+        # Keep idle event-push sockets alive; the server sends pings every 30s.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # Optional: restrict registration/admin endpoints by source IP.
+        # location = /register { ... }
+        # location ^~ /admin/ { ... }
+    }
+}

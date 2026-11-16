@@ -1,0 +1,36 @@
+[package]
+name = "onebot-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A OneBot 11 prototype server with a protocol-neutral core and OneBot 12-ready seams"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+base64 = "0.23.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-none",
+    "postgres",
+    "chrono",
+    "json",
+    "macros",
+    "migrate",
+] }
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tower-http = { version = "0.7.1", features = ["trace", "cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
