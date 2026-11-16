@@ -27,6 +27,7 @@
 - [协议抽象与 OB12 预留](#协议抽象与-ob12-预留)
 - [Nginx 部署](#nginx-部署)
 - [测试与验收](#测试与验收)
+- [版本管理与发布](#版本管理与发布)
 - [限制与 TODO](#限制与-todo)
 
 更详细的文档：
@@ -526,6 +527,18 @@ python scripts/e2e.py
 ```
 
 最近一次本机运行：**86 项端到端检查全部通过**；另有 **11 个 Rust 单元测试**通过，并用 Playwright/Chromium 验证了桌面、移动端、`file://` 直接打开、好友/入群审批、消息收发与 token 重置。详见 [docs/TESTING.md](docs/TESTING.md)。
+
+---
+
+## 版本管理与发布
+
+本项目采用：
+
+- **Semantic Versioning 2.0.0**：`MAJOR.MINOR.PATCH`，当前版本 `0.1.0`。
+- **Conventional Commits**：`feat:` / `fix:` / `docs:` / `refactor:` / `chore:` 等，破坏性变更使用 `!` 与 `BREAKING CHANGE:` footer。
+- 发布时必须更新 `CHANGELOG.md`、`Cargo.toml`，并创建 `vX.Y.Z` 附注 tag。
+- 版本号唯一来源为 `Cargo.toml` 的 `package.version`。
+- 发布流程与提交规范见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
