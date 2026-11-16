@@ -575,7 +575,7 @@ python scripts/e2e.py
 
 本项目采用：
 
-- **Semantic Versioning 2.0.0**：`MAJOR.MINOR.PATCH`，当前版本 `0.1.0`。
+- **Semantic Versioning 2.0.0**：`MAJOR.MINOR.PATCH`，当前版本 `0.2.0`。
 - **Conventional Commits**：`feat:` / `fix:` / `docs:` / `refactor:` / `chore:` 等，破坏性变更使用 `!` 与 `BREAKING CHANGE:` footer。
 - 发布时必须更新 `CHANGELOG.md`、`Cargo.toml`，并创建 `vX.Y.Z` 附注 tag。
 - 版本号唯一来源为 `Cargo.toml` 的 `package.version`。

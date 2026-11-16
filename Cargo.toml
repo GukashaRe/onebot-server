@@ -1,6 +1,6 @@
 [package]
 name = "onebot-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 description = "A OneBot 11 prototype server with a protocol-neutral core and OneBot 12-ready seams"
