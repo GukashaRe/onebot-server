@@ -40,6 +40,26 @@ pub enum InternalAction {
         after_seq: Option<i64>,
         limit: Option<i64>,
     },
+    SetGroupKick {
+        group_id: i64,
+        user_id: i64,
+        reject_add_request: Option<bool>,
+    },
+    SetGroupBan {
+        group_id: i64,
+        user_id: i64,
+        duration_seconds: i64,
+    },
+    SetGroupAdmin {
+        group_id: i64,
+        user_id: i64,
+        enable: bool,
+    },
+    SetGroupCard {
+        group_id: i64,
+        user_id: i64,
+        card: String,
+    },
     /// A syntactically valid, but unsupported OB11 action. It must still yield a
     /// standard OB11 failure response (retcode 1404), never HTTP 500.
     Unsupported {

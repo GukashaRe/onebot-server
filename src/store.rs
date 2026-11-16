@@ -1,5 +1,6 @@
-use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde_json::{Value, json};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
 
 use crate::{
@@ -61,6 +62,35 @@ pub struct GroupRecord {
     pub name: String,
     pub owner_id: i64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct KickOutcome {
+    pub group_id: i64,
+    pub target_id: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BanOutcome {
+    pub group_id: i64,
+    pub target_id: i64,
+    pub duration_seconds: i64,
+    pub banned_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminOutcome {
+    pub group_id: i64,
+    pub target_id: i64,
+    pub enable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CardOutcome {
+    pub group_id: i64,
+    pub target_id: i64,
+    pub old_card: String,
+    pub new_card: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -130,6 +160,7 @@ struct MemberRow {
     account_id: i64,
     username: String,
     role: String,
+    card: String,
     joined_at: DateTime<Utc>,
 }
 
@@ -140,9 +171,17 @@ impl From<MemberRow> for GroupMemberView {
             account_id: row.account_id,
             username: row.username,
             role: row.role,
+            card: row.card,
             joined_at: row.joined_at,
         }
     }
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct MemberLockRow {
+    account_id: i64,
+    role: String,
+    card: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -632,7 +671,7 @@ impl Store {
     ) -> Result<GroupMemberView, StoreError> {
         let row = sqlx::query_as::<_, MemberRow>(
             r#"
-            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.joined_at
+            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.card, gm.joined_at
             FROM group_members gm
             JOIN accounts a ON a.id = gm.account_id
             WHERE gm.group_id = $1 AND gm.account_id = $2
@@ -649,7 +688,7 @@ impl Store {
     pub async fn list_members(&self, group_id: i64) -> Result<Vec<GroupMemberView>, StoreError> {
         let rows = sqlx::query_as::<_, MemberRow>(
             r#"
-            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.joined_at
+            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.card, gm.joined_at
             FROM group_members gm
             JOIN accounts a ON a.id = gm.account_id
             WHERE gm.group_id = $1
@@ -668,7 +707,7 @@ impl Store {
     ) -> Result<Vec<GroupMemberView>, StoreError> {
         let rows = sqlx::query_as::<_, MemberRow>(
             r#"
-            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.joined_at
+            SELECT gm.group_id, gm.account_id, a.username, gm.role, gm.card, gm.joined_at
             FROM group_members gm
             JOIN accounts a ON a.id = gm.account_id
             WHERE gm.group_id = $1 AND gm.role IN ('owner', 'admin')
@@ -679,6 +718,294 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    // --------------------------------------------------------- group management
+
+    /// Returns the current active ban for a member, or None if unbanned/expired.
+    /// Expiry is evaluated by the database clock; no cleanup task is required.
+    pub async fn active_group_ban(
+        &self,
+        group_id: i64,
+        account_id: i64,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let row = sqlx::query_scalar::<_, DateTime<Utc>>(
+            r#"
+            SELECT banned_until
+            FROM group_bans
+            WHERE group_id = $1 AND account_id = $2 AND banned_until > now()
+            "#,
+        )
+        .bind(group_id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn set_group_kick(
+        &self,
+        actor_id: i64,
+        group_id: i64,
+        target_id: i64,
+        reject_add_request: bool,
+    ) -> Result<KickOutcome, StoreError> {
+        if actor_id == target_id {
+            return Err(StoreError::Forbidden(
+                "cannot kick yourself from the group".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let (actor, target) =
+            lock_moderation_members(&mut tx, group_id, actor_id, target_id).await?;
+
+        if target.role == "owner" {
+            return Err(StoreError::Forbidden(
+                "cannot kick the group owner".to_owned(),
+            ));
+        }
+        match actor.role.as_str() {
+            "owner" => {}
+            "admin" if target.role == "member" => {}
+            "admin" => {
+                return Err(StoreError::Forbidden(
+                    "an admin may only kick regular members".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(StoreError::Forbidden(
+                    "only the owner or an admin may kick members".to_owned(),
+                ));
+            }
+        }
+
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND account_id = $2")
+            .bind(group_id)
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM group_bans WHERE group_id = $1 AND account_id = $2")
+            .bind(group_id)
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?;
+        insert_audit_log(
+            &mut tx,
+            actor_id,
+            "group_kick",
+            Some(target_id),
+            Some(group_id),
+            json!({ "reject_add_request": reject_add_request }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(KickOutcome {
+            group_id,
+            target_id,
+        })
+    }
+
+    pub async fn set_group_ban(
+        &self,
+        actor_id: i64,
+        group_id: i64,
+        target_id: i64,
+        duration_seconds: i64,
+    ) -> Result<BanOutcome, StoreError> {
+        if duration_seconds < 0 {
+            return Err(StoreError::Conflict(
+                "ban duration must be zero or positive".to_owned(),
+            ));
+        }
+        if actor_id == target_id {
+            return Err(StoreError::Forbidden(
+                "cannot ban yourself in the group".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let (actor, target) =
+            lock_moderation_members(&mut tx, group_id, actor_id, target_id).await?;
+
+        if target.role == "owner" {
+            return Err(StoreError::Forbidden(
+                "cannot ban the group owner".to_owned(),
+            ));
+        }
+        match actor.role.as_str() {
+            "owner" => {}
+            "admin" if target.role == "member" => {}
+            "admin" => {
+                return Err(StoreError::Forbidden(
+                    "an admin may only ban regular members".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(StoreError::Forbidden(
+                    "only the owner or an admin may ban members".to_owned(),
+                ));
+            }
+        }
+
+        let banned_until = if duration_seconds > 0 {
+            Some(
+                Utc::now()
+                    .checked_add_signed(ChronoDuration::seconds(duration_seconds))
+                    .ok_or_else(|| StoreError::Conflict("ban duration is too large".to_owned()))?,
+            )
+        } else {
+            None
+        };
+
+        match banned_until {
+            Some(until) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO group_bans
+                        (group_id, account_id, banned_until, operator_id)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (group_id, account_id)
+                    DO UPDATE SET
+                        banned_until = EXCLUDED.banned_until,
+                        operator_id = EXCLUDED.operator_id,
+                        created_at = now()
+                    "#,
+                )
+                .bind(group_id)
+                .bind(target_id)
+                .bind(until)
+                .bind(actor_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM group_bans WHERE group_id = $1 AND account_id = $2")
+                    .bind(group_id)
+                    .bind(target_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        insert_audit_log(
+            &mut tx,
+            actor_id,
+            "group_ban",
+            Some(target_id),
+            Some(group_id),
+            json!({
+                "duration_seconds": duration_seconds,
+                "banned_until": banned_until.map(|value| value.to_rfc3339()),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(BanOutcome {
+            group_id,
+            target_id,
+            duration_seconds,
+            banned_until,
+        })
+    }
+
+    pub async fn set_group_admin(
+        &self,
+        actor_id: i64,
+        group_id: i64,
+        target_id: i64,
+        enable: bool,
+    ) -> Result<AdminOutcome, StoreError> {
+        if actor_id == target_id {
+            return Err(StoreError::Forbidden(
+                "the owner cannot change their own admin role".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let (actor, target) =
+            lock_moderation_members(&mut tx, group_id, actor_id, target_id).await?;
+        if actor.role != "owner" {
+            return Err(StoreError::Forbidden(
+                "only the group owner may set or unset admins".to_owned(),
+            ));
+        }
+        if target.role == "owner" {
+            return Err(StoreError::Forbidden(
+                "cannot change the group owner's role".to_owned(),
+            ));
+        }
+
+        let new_role = if enable { "admin" } else { "member" };
+        sqlx::query("UPDATE group_members SET role = $3 WHERE group_id = $1 AND account_id = $2")
+            .bind(group_id)
+            .bind(target_id)
+            .bind(new_role)
+            .execute(&mut *tx)
+            .await?;
+        insert_audit_log(
+            &mut tx,
+            actor_id,
+            "group_admin",
+            Some(target_id),
+            Some(group_id),
+            json!({ "enable": enable, "new_role": new_role }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(AdminOutcome {
+            group_id,
+            target_id,
+            enable,
+        })
+    }
+
+    pub async fn set_group_card(
+        &self,
+        actor_id: i64,
+        group_id: i64,
+        target_id: i64,
+        card: &str,
+    ) -> Result<CardOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let (actor, target) =
+            lock_moderation_members(&mut tx, group_id, actor_id, target_id).await?;
+
+        match actor.role.as_str() {
+            "owner" => {}
+            "admin" if target.role == "member" => {}
+            "admin" => {
+                return Err(StoreError::Forbidden(
+                    "an admin may only change regular members' cards".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(StoreError::Forbidden(
+                    "only the owner or an admin may change group cards".to_owned(),
+                ));
+            }
+        }
+
+        let old_card = target.card;
+        sqlx::query("UPDATE group_members SET card = $3 WHERE group_id = $1 AND account_id = $2")
+            .bind(group_id)
+            .bind(target_id)
+            .bind(card)
+            .execute(&mut *tx)
+            .await?;
+        insert_audit_log(
+            &mut tx,
+            actor_id,
+            "group_card",
+            Some(target_id),
+            Some(group_id),
+            json!({ "old_card": old_card, "new_card": card }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CardOutcome {
+            group_id,
+            target_id,
+            old_card,
+            new_card: card.to_owned(),
+        })
     }
 
     pub async fn create_group_join_request(
@@ -883,6 +1210,11 @@ impl Store {
         if deleted.rows_affected() == 0 {
             return Err(StoreError::NotFound("group member".to_owned()));
         }
+        sqlx::query("DELETE FROM group_bans WHERE group_id = $1 AND account_id = $2")
+            .bind(group_id)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(group.into())
     }
@@ -994,6 +1326,67 @@ impl Store {
         )
         .await
     }
+}
+
+async fn lock_moderation_members(
+    tx: &mut Transaction<'_, Postgres>,
+    group_id: i64,
+    actor_id: i64,
+    target_id: i64,
+) -> Result<(MemberLockRow, MemberLockRow), StoreError> {
+    let mut ids = vec![actor_id];
+    if target_id != actor_id {
+        ids.push(target_id);
+    }
+    let rows = sqlx::query_as::<_, MemberLockRow>(
+        r#"
+        SELECT account_id, role, card
+        FROM group_members
+        WHERE group_id = $1 AND account_id = ANY($2)
+        FOR UPDATE
+        "#,
+    )
+    .bind(group_id)
+    .bind(&ids)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let actor = rows
+        .iter()
+        .find(|row| row.account_id == actor_id)
+        .cloned()
+        .ok_or_else(|| StoreError::Forbidden("not a member of this group".to_owned()))?;
+    let target = rows
+        .iter()
+        .find(|row| row.account_id == target_id)
+        .cloned()
+        .ok_or_else(|| StoreError::NotFound("group member".to_owned()))?;
+    Ok((actor, target))
+}
+
+async fn insert_audit_log(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_id: i64,
+    action: &str,
+    target_id: Option<i64>,
+    group_id: Option<i64>,
+    detail: Value,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs
+            (actor_id, action, target_type, target_id, group_id, detail)
+        VALUES ($1, $2, 'account', $3, $4, $5)
+        "#,
+    )
+    .bind(actor_id)
+    .bind(action)
+    .bind(target_id)
+    .bind(group_id)
+    .bind(sqlx::types::Json(detail))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn ordered_pair(a: i64, b: i64) -> (i64, i64) {

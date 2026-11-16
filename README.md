@@ -22,6 +22,7 @@
 - [核心架构](#核心架构)
 - [认证模型](#认证模型)
 - [HTTP API 一览](#http-api-一览)
+- [群管动作与权限](#群管动作与权限)
 - [WebSocket 事件](#websocket-事件)
 - [会话、存储与历史](#会话存储与历史)
 - [协议抽象与 OB12 预留](#协议抽象与-ob12-预留)
@@ -371,6 +372,43 @@ pub trait ProtocolAdapter: Send + Sync {
 
 ---
 
+## 群管动作与权限
+
+新增 4 个 OB11 群管动作：
+
+| 动作 | 参数 | 权限 |
+|---|---|---|
+| `set_group_kick` | `group_id`, `user_id`, 可选 `reject_add_request` | owner 可踢非自己的任何人；admin 只能踢 member；member 禁止 |
+| `set_group_ban` | `group_id`, `user_id`, `duration`（秒，0=解除） | owner 可禁言非自己的任何人（含 admin）；admin 只能禁言 member；member 禁止 |
+| `set_group_admin` | `group_id`, `user_id`, `enable` | 仅 owner；不能对 owner 调用 |
+| `set_group_card` | `group_id`, `user_id`, `card` | owner 可改任何人（含自己）；admin 只能改 member；member 禁止 |
+
+硬性约束：
+
+- 权限由 token 对应账号在目标群中的 `group_members.role` 决定，与账号背后是人还是程序无关。
+- 所有不满足权限的操作返回 HTTP 200 + OB11 `status:"failed"` + `retcode:1403`，不返回 500。
+- 不能踢/禁言自己；不能踢/禁言 owner；admin 不能操作 admin/owner。
+- 群名片持久化在 `group_members.card`；空字符串表示清除。
+- 禁言持久化在 `group_bans(group_id, account_id, banned_until, operator_id, created_at)`；到期时间由数据库时钟判断，重启不丢，过期自动失效，无需定时任务。
+- 被禁言成员调用 `send_group_msg` 或 `send_msg(message_type=group)` 会在落库前返回 1403，不写 messages、不扇出。
+- 每个成功群管操作在 `audit_logs` 写入一条事务内审计：`actor_id`、`action`、`target_type`、`target_id`、`group_id`、`detail`、`created_at`。
+- `reject_add_request` 参数被解析并记录到审计 detail，但当前原型未实现持久化的“拒绝再次加群”名单。
+
+群管 notice：
+
+| 动作 | notice |
+|---|---|
+| 踢人 | 剩余成员收到 `group_decrease` + `sub_type:"kick"`；被踢账号额外直接收到 `sub_type:"kick_me"` |
+| 禁言 | 所有群成员（含被禁言者）收到 `group_ban`，`sub_type:"ban"`，含 `duration`；解除时 `sub_type:"lift_ban"` 且 `duration:0` |
+| 设/撤管理员 | 所有群成员收到 `group_admin`，`sub_type:"set"` / `"unset"` |
+| 改名片 | 所有群成员收到 `group_card`，含 `card`（新名片）与扩展字段 `old_card` |
+
+所有 notice 继续按接收账号独立填充 `self_id`；被踢账号不再属于群成员，因此不会收到后续群消息。
+
+更完整的请求/响应示例见 [docs/API.md](docs/API.md)。
+
+---
+
 ## WebSocket 事件
 
 - WS 只推事件，不接受动作调用；客户端发来的文本会被忽略。
@@ -401,7 +439,8 @@ pub trait ProtocolAdapter: Send + Sync {
 
 - `self_id` 是该接收者自己的账号 ID。
 - 私聊给会话双方都推，包括发送方回显；客户端用 `message_id` 去重。
-- 群成员变动推 `notice`（`group_increase` / `group_decrease`）；退群者不会收到自己的 `group_decrease`。
+- 群成员变动推 `notice`（`group_increase` / `group_decrease`）；退群者不会收到自己的 `group_decrease`；踢人时剩余成员收到 `group_decrease(kick)`，被踢者额外收到 `group_decrease(kick_me)`。
+- 群管动作还会推 `group_ban`、`group_admin`、`group_card` notice，全部按接收账号填 `self_id`。
 - 好友申请推 `request`（`request_type:"friend"`）；入群申请推 `request`（`request_type:"group"`, `sub_type:"add"`）给所有 owner/admin。
 - `message_seq` 是为历史游标增加的 OB11 扩展字段；客户端可以忽略，也可用于补拉。
 - 私聊消息事件额外带 `peer_id` 扩展（对端账号）。OB11 原始 `user_id` 在发送方回显时是发送者自身，浏览器客户端需要 `peer_id` 才能把回显路由到正确会话；这是当前原型的兼容扩展。
@@ -422,7 +461,7 @@ private session_id = "<min(account_a, account_b)>:<max(account_a, account_b)>"
 
 ### 群聊
 
-`session_type = "group"`，`session_id = group_id`。群成员表角色为 `owner/admin/member`；创建者自动成为 owner；owner 原型阶段禁止退群。
+`session_type = "group"`，`session_id = group_id`。群成员表角色为 `owner/admin/member`；创建者自动成为 owner；owner 原型阶段禁止退群。群内名片存于 `group_members.card`，会出现在成员信息与 `sender.card` 中。
 
 ### message_seq 分配
 
@@ -459,11 +498,13 @@ private session_id = "<min(account_a, account_b)>:<max(account_a, account_b)>"
 | `friends` | 有序对 `account_a < account_b`，PRIMARY KEY |
 | `friend_requests` | pending/approved/rejected；同对仅一个 pending |
 | `groups` | `id`, `name`, `owner_id`, `created_at` |
-| `group_members` | `(group_id, account_id)` UNIQUE；role owner/admin/member；每群一个 owner |
+| `group_members` | `(group_id, account_id)` UNIQUE；role owner/admin/member；`card`；每群一个 owner |
 | `group_join_requests` | 群+账号仅一个 pending |
+| `group_bans` | 持久化禁言：群、账号、`banned_until`、operator；主键 `(group_id, account_id)` |
 | `messages` | `session_type`, `session_id`, `sender_id`, `message_seq`, JSONB `content`, `recalled` |
 | `message_sequences` | 会话内下一位序号分配器 |
-| `token_reset_audit` | 账号、actor、reason、时间 |
+| `audit_logs` | 群管审计：actor、action、target、group、detail JSONB、时间 |
+| `token_reset_audit` | token 重置审计（与群管审计表分开保留） |
 
 `connections` 只存在于内存，不在 PostgreSQL。
 
@@ -526,7 +567,7 @@ export ADMIN_KEY='...'
 python scripts/e2e.py
 ```
 
-最近一次本机运行：**86 项端到端检查全部通过**；另有 **11 个 Rust 单元测试**通过，并用 Playwright/Chromium 验证了桌面、移动端、`file://` 直接打开、好友/入群审批、消息收发与 token 重置。详见 [docs/TESTING.md](docs/TESTING.md)。
+最近一次本机运行：**149 项端到端检查全部通过**；另有 **14 个 Rust 单元测试**通过，并用 Playwright/Chromium 验证了桌面、移动端、`file://` 直接打开、好友/入群审批、消息收发与 token 重置。群管部分额外手工验证了服务重启后禁言仍生效、以及把 `banned_until` 改为过去时间后发送恢复。详见 [docs/TESTING.md](docs/TESTING.md)。
 
 ---
 
@@ -549,14 +590,14 @@ python scripts/e2e.py
 - **CQ 码字符串解析/编码**：只接受消息段数组；传 CQ 字符串会返回参数错误。TODO 标记在适配器注释中。
 - **反向 WebSocket**：只做正向 WS（服务端推事件）。
 - **OB12 适配器实现**：只留 trait 实现位置、TODO 和 `initial_events` 钩子。
-- 动作清单之外的 OneBot 动作（群踢人/禁言/设管理、请求审批动作、文件/图片上传、频道等）。
+- 动作清单之外的 OneBot 动作（`set_group_leave`、群名/群头像、撤回消息、请求审批动作、文件/图片上传、频道等）。
 - 完整生产级人类 UI、SDK（仓库提供的是原型单文件 HTML 客户端）。
 - 分布式部署、多实例连接表共享。
 - TLS（Nginx 负责）。
 - 找回 token（只能重置）。
 - 按账号类型的权限分支（不存在账号类型）。
 - 消息清理/保留窗口策略（当前永久保留，保留窗口待定）。
-- 好友删除、群解散、群主转让、管理员设置等管理功能。
+- 好友删除、群解散、群主转让、群公告/群文件等未在动作清单中的管理功能。
 - 通知重发、消息已读等扩展。
 - HTTP 动作的 `echo` 回显（当前忽略未知字段；响应固定三字段）。
 

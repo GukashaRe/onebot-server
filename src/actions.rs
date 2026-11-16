@@ -4,7 +4,11 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ActionError, RETCODE_INTERNAL, RETCODE_NOT_FOUND},
-    fanout::{build_message_event, fanout_group_message, fanout_private_message},
+    fanout::{
+        GroupNotice, GroupNoticeExtras, build_message_event, fanout_group_message,
+        fanout_group_notice, fanout_group_notice_to_account, fanout_group_notice_with_extras,
+        fanout_private_message,
+    },
     model::{
         Account, ActionRequest, ChatEvent, InternalAction, MessageSegment, SessionType,
         private_session_id,
@@ -61,6 +65,35 @@ pub async fn execute(
             after_seq,
             limit,
         } => get_friend_history(state, actor, user_id, before_seq, after_seq, limit).await,
+        InternalAction::SetGroupKick {
+            group_id,
+            user_id,
+            reject_add_request,
+        } => {
+            set_group_kick_action(
+                state,
+                actor,
+                group_id,
+                user_id,
+                reject_add_request.unwrap_or(false),
+            )
+            .await
+        }
+        InternalAction::SetGroupBan {
+            group_id,
+            user_id,
+            duration_seconds,
+        } => set_group_ban_action(state, actor, group_id, user_id, duration_seconds).await,
+        InternalAction::SetGroupAdmin {
+            group_id,
+            user_id,
+            enable,
+        } => set_group_admin_action(state, actor, group_id, user_id, enable).await,
+        InternalAction::SetGroupCard {
+            group_id,
+            user_id,
+            card,
+        } => set_group_card_action(state, actor, group_id, user_id, &card).await,
         InternalAction::Unsupported { name } => Err(ActionError::unsupported(&name)),
     }
 }
@@ -149,6 +182,17 @@ async fn send_group(
             StoreError::NotFound(_) => ActionError::forbidden("not a member of this group"),
             other => map_store_error(other),
         })?;
+    if let Some(until) = state
+        .store
+        .active_group_ban(group_id, actor.id)
+        .await
+        .map_err(map_store_error)?
+    {
+        return Err(ActionError::forbidden(format!(
+            "sender is banned in this group until {}",
+            until.to_rfc3339()
+        )));
+    }
 
     let stored = state
         .store
@@ -163,6 +207,177 @@ async fn send_group(
         "message_id": stored.id,
         "message_seq": stored.message_seq,
     }))
+}
+
+async fn set_group_kick_action(
+    state: &AppState,
+    actor: &Account,
+    group_id: i64,
+    target_id: i64,
+    reject_add_request: bool,
+) -> Result<Value, ActionError> {
+    validate_target_id(group_id)?;
+    validate_target_id(target_id)?;
+    state
+        .store
+        .set_group_kick(actor.id, group_id, target_id, reject_add_request)
+        .await
+        .map_err(map_store_error)?;
+    state.cache.invalidate_group(group_id).await;
+
+    if let Err(err) = fanout_group_notice(
+        state,
+        group_id,
+        "group_decrease",
+        actor.id,
+        target_id,
+        "kick",
+        &[],
+    )
+    .await
+    {
+        tracing::error!(error = %err, group_id, target_id, "group kick notice fanout failed");
+    }
+    if let Err(err) = fanout_group_notice_to_account(
+        state,
+        target_id,
+        GroupNotice::new(
+            group_id,
+            "group_decrease",
+            actor.id,
+            target_id,
+            Some("kick_me"),
+            GroupNoticeExtras::default(),
+        ),
+    )
+    .await
+    {
+        tracing::error!(error = %err, group_id, target_id, "kick_me notice fanout failed");
+    }
+
+    Ok(Value::Null)
+}
+
+async fn set_group_ban_action(
+    state: &AppState,
+    actor: &Account,
+    group_id: i64,
+    target_id: i64,
+    duration_seconds: i64,
+) -> Result<Value, ActionError> {
+    validate_target_id(group_id)?;
+    validate_target_id(target_id)?;
+    if duration_seconds < 0 {
+        return Err(ActionError::invalid("duration must be zero or positive"));
+    }
+    let outcome = state
+        .store
+        .set_group_ban(actor.id, group_id, target_id, duration_seconds)
+        .await
+        .map_err(map_store_error)?;
+    let sub_type = if outcome.duration_seconds > 0 {
+        "ban"
+    } else {
+        "lift_ban"
+    };
+    if let Err(err) = fanout_group_notice_with_extras(
+        state,
+        GroupNotice::new(
+            group_id,
+            "group_ban",
+            actor.id,
+            target_id,
+            Some(sub_type),
+            GroupNoticeExtras {
+                duration: Some(outcome.duration_seconds),
+                ..GroupNoticeExtras::default()
+            },
+        ),
+        &[],
+    )
+    .await
+    {
+        tracing::error!(error = %err, group_id, target_id, "group ban notice fanout failed");
+    }
+    Ok(Value::Null)
+}
+
+async fn set_group_admin_action(
+    state: &AppState,
+    actor: &Account,
+    group_id: i64,
+    target_id: i64,
+    enable: bool,
+) -> Result<Value, ActionError> {
+    validate_target_id(group_id)?;
+    validate_target_id(target_id)?;
+    let outcome = state
+        .store
+        .set_group_admin(actor.id, group_id, target_id, enable)
+        .await
+        .map_err(map_store_error)?;
+    state.cache.invalidate_group(group_id).await;
+    let sub_type = if outcome.enable { "set" } else { "unset" };
+    if let Err(err) = fanout_group_notice_with_extras(
+        state,
+        GroupNotice::new(
+            group_id,
+            "group_admin",
+            actor.id,
+            target_id,
+            Some(sub_type),
+            GroupNoticeExtras::default(),
+        ),
+        &[],
+    )
+    .await
+    {
+        tracing::error!(error = %err, group_id, target_id, "group admin notice fanout failed");
+    }
+    Ok(Value::Null)
+}
+
+async fn set_group_card_action(
+    state: &AppState,
+    actor: &Account,
+    group_id: i64,
+    target_id: i64,
+    card: &str,
+) -> Result<Value, ActionError> {
+    validate_target_id(group_id)?;
+    validate_target_id(target_id)?;
+    if card.chars().count() > 128 {
+        return Err(ActionError::invalid(
+            "group card must be at most 128 characters",
+        ));
+    }
+    let outcome = state
+        .store
+        .set_group_card(actor.id, group_id, target_id, card)
+        .await
+        .map_err(map_store_error)?;
+    state.cache.invalidate_group(group_id).await;
+    if let Err(err) = fanout_group_notice_with_extras(
+        state,
+        GroupNotice::new(
+            group_id,
+            "group_card",
+            actor.id,
+            target_id,
+            None,
+            GroupNoticeExtras {
+                card: Some(outcome.new_card.clone()),
+                old_card: Some(outcome.old_card.clone()),
+                ..GroupNoticeExtras::default()
+            },
+        ),
+        &[],
+    )
+    .await
+    {
+        tracing::error!(error = %err, group_id, target_id, "group card notice fanout failed");
+    }
+    Ok(Value::Null)
 }
 
 async fn get_group_list(state: &AppState, actor: &Account) -> Result<Value, ActionError> {
@@ -213,7 +428,7 @@ async fn get_group_member_list(
                 "group_id": member.group_id,
                 "user_id": member.account_id,
                 "nickname": member.username,
-                "card": "",
+                "card": member.card,
                 "role": member.role,
                 "join_time": member.joined_at.timestamp(),
             })
@@ -247,7 +462,7 @@ async fn get_group_member_info(
         "group_id": member.group_id,
         "user_id": member.account_id,
         "nickname": member.username,
-        "card": "",
+        "card": member.card,
         "role": member.role,
         "join_time": member.joined_at.timestamp(),
     }))
@@ -324,6 +539,15 @@ async fn get_group_history(
                 .collect()
         })
         .unwrap_or_default();
+    let cards: HashMap<i64, String> = members
+        .as_ref()
+        .map(|members| {
+            members
+                .iter()
+                .map(|m| (m.account_id, m.card.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let group_name = state.store.get_group(group_id).await.ok().map(|g| g.name);
 
     let mut events = Vec::with_capacity(messages.len());
@@ -333,7 +557,9 @@ async fn get_group_history(
             .cloned()
             .unwrap_or_else(|| format!("account-{}", message.sender_id));
         let role = roles.get(&message.sender_id).map(String::as_str);
-        let mut event = build_message_event(message, &sender_name, role, group_name.as_deref());
+        let card = cards.get(&message.sender_id).map(String::as_str);
+        let mut event =
+            build_message_event(message, &sender_name, role, card, group_name.as_deref());
         event.account_id = actor.id_string();
         event.session_id = Some(group_id.to_string());
         events.push(serialize_for_action(state, actor, &event)?);
@@ -373,7 +599,7 @@ async fn get_friend_history(
             .get(&message.sender_id)
             .cloned()
             .unwrap_or_else(|| format!("account-{}", message.sender_id));
-        let mut event = build_message_event(message, &sender_name, None, None);
+        let mut event = build_message_event(message, &sender_name, None, None, None);
         event.account_id = actor.id_string();
         event.session_id = Some(peer_id.to_string());
         events.push(serialize_for_action(state, actor, &event)?);

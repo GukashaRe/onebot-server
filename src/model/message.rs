@@ -51,6 +51,7 @@ pub struct GroupMemberView {
     pub account_id: i64,
     pub username: String,
     pub role: String,
+    pub card: String,
     pub joined_at: DateTime<Utc>,
 }
 

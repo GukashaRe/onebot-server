@@ -131,7 +131,11 @@ HTTP 状态码表达语义：400 参数错误、401 未认证、403 禁止、404
       "get_group_member_info",
       "get_friend_list",
       "get_group_msg_history",
-      "get_friend_msg_history"
+      "get_friend_msg_history",
+      "set_group_kick",
+      "set_group_ban",
+      "set_group_admin",
+      "set_group_card"
     ],
     "rate_limit_per_second": 20
   },
@@ -363,6 +367,7 @@ curl -sS http://127.0.0.1:8080/api/get_group_list \
 - 游标语义是半开区间：`after_seq` 不含该 seq，`before_seq` 不含该 seq。
 - 只支持 `message_seq` 游标；不支持 offset/message_id 分页。
 - 私聊消息事件额外带 `peer_id`（对端账号）扩展，便于客户端把发送方回显路由到正确会话。它是兼容扩展，OB11 客户端可忽略。
+- 群管 notice：`group_decrease`（`kick` / `kick_me`）、`group_ban`（含 `duration`）、`group_admin`（`set` / `unset`）、`group_card`（含 `card` 与 `old_card`）；每个接收者的 `self_id` 均为自己的账号 ID。
 
 ### `get_friend_msg_history`
 
@@ -394,7 +399,185 @@ while True:
 
 ---
 
-## 6. 自定义关系 API
+## 6. 动作：群管理
+
+所有群管动作成功时返回：
+
+```json
+{"status":"ok","retcode":0,"data":null}
+```
+
+权限不满足、目标为 owner/自己或角色矩阵不允许时返回 HTTP 200：
+
+```json
+{"status":"failed","retcode":1403,"data":null}
+```
+
+权限判断只读取调用者 token 对应账号在目标群的 `group_members.role`，不区分人类/机器人。
+
+### `set_group_kick`
+
+参数：
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---:|---|
+| `group_id` | number/string | 是 | 群 ID |
+| `user_id` | number/string | 是 | 被踢账号 |
+| `reject_add_request` | boolean | 否 | 接受并写入审计 detail；原型暂不实现持久化拒绝名单 |
+
+权限：
+
+- owner：可踢除自己以外的任何人（admin/member）
+- admin：只能踢 member
+- member：禁止
+- 不能踢 owner，不能踢自己
+
+效果：
+
+- 删除 `group_members` 记录与相关 `group_bans`；
+- 剩余成员收到 `group_decrease(kick)`；
+- 被踢者自己的在线 WS 收到 `group_decrease(kick_me)`；
+- 被踢者不再收到该群后续消息；
+- 写 `audit_logs`，action=`group_kick`。
+
+示例：
+
+```json
+{"action":"set_group_kick","params":{"group_id":1,"user_id":2,"reject_add_request":false}}
+```
+
+被踢者收到的通知（注意 `self_id` 是被踢者）：
+
+```json
+{
+  "post_type":"notice",
+  "notice_type":"group_decrease",
+  "sub_type":"kick_me",
+  "time":1763300000,
+  "self_id":2,
+  "group_id":1,
+  "operator_id":1,
+  "user_id":2
+}
+```
+
+### `set_group_ban`
+
+参数：
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---:|---|
+| `group_id` | number/string | 是 | 群 ID |
+| `user_id` | number/string | 是 | 被禁言账号 |
+| `duration` | integer | 是 | 秒；0 表示解除禁言 |
+
+权限：
+
+- owner：可禁言自己以外的任何人（含 admin）
+- admin：只能禁言 member
+- member：禁止
+- 不能禁言 owner，不能禁言自己
+
+效果：
+
+- 写入/更新 `group_bans`，`banned_until = now() + duration`；`duration=0` 删除记录；
+- 被禁言者在 `banned_until > now()` 期间调用 `send_group_msg` 或 `send_msg(message_type=group)` 返回 1403，消息不落库、不扇出；
+- 过期后自动恢复，无需定时任务；重启服务后状态仍生效；
+- 所有群成员（含被禁言者）收到 `group_ban` notice，包含 `duration` 和 `operator_id`；
+- 解除时 `sub_type="lift_ban"`、`duration=0`；
+- 写 `audit_logs`，action=`group_ban`，detail 含时长与到期时间。
+
+示例：
+
+```json
+{"action":"set_group_ban","params":{"group_id":1,"user_id":2,"duration":60}}
+```
+
+通知：
+
+```json
+{
+  "post_type":"notice",
+  "notice_type":"group_ban",
+  "sub_type":"ban",
+  "time":1763300000,
+  "self_id":3,
+  "group_id":1,
+  "operator_id":1,
+  "user_id":2,
+  "duration":60
+}
+```
+
+### `set_group_admin`
+
+参数：
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---:|---|
+| `group_id` | number/string | 是 | 群 ID |
+| `user_id` | number/string | 是 | 目标账号 |
+| `enable` | boolean | 是 | true=设为 admin，false=撤为 member |
+
+权限：
+
+- 仅 owner；admin/member 调用返回 1403；
+- 不能对 owner 调用。
+
+效果：
+
+- 更新 `group_members.role`（admin ↔ member）；
+- 所有群成员收到 `group_admin` notice，`sub_type="set"` / `"unset"`；
+- 写 `audit_logs`，action=`group_admin`。
+
+### `set_group_card`
+
+参数：
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---:|---|
+| `group_id` | number/string | 是 | 群 ID |
+| `user_id` | number/string | 是 | 目标账号 |
+| `card` | string | 是 | 新群名片；空字符串表示清除；最长 128 字符 |
+
+权限：
+
+- owner：可改任何人，包括自己；
+- admin：只能改 member，不能改 owner/admin；
+- member：禁止。
+
+效果：
+
+- 更新 `group_members.card`；
+- 所有群成员收到 `group_card` notice，含 `card`（新）与扩展字段 `old_card`；
+- 群消息 sender 与成员信息中会反映新名片；
+- 写 `audit_logs`，action=`group_card`，detail 含新旧名片。
+
+### 审计
+
+每个成功的群管操作在**同一数据库事务**内写入：
+
+```sql
+INSERT INTO audit_logs
+  (actor_id, action, target_type, target_id, group_id, detail)
+VALUES (...);
+```
+
+字段：
+
+- `actor_id`：操作者账号
+- `action`：`group_kick` / `group_ban` / `group_admin` / `group_card`
+- `target_type`：`account`
+- `target_id`：被操作账号
+- `group_id`：群
+- `detail`：JSON，动作参数/新旧值/时长
+- `created_at`：数据库时间
+
+token 重置审计仍保留在 `token_reset_audit` 表；群管审计在 `audit_logs`。
+
+---
+
+## 7. 自定义关系 API
 
 所有端点均需 Bearer token。
 
@@ -574,7 +757,7 @@ while True:
 
 ---
 
-## 7. 错误码
+## 8. 错误码
 
 | retcode | 含义 | 典型场景 |
 |---:|---|---|
@@ -582,8 +765,8 @@ while True:
 | `1200` | 限流 | 超过账号的每秒动作配额（原型扩展码） |
 | `1400` | 参数错误 | 非法 JSON、缺失字段、CQ 字符串、非法 message_type |
 | `1401` | 未认证 | HTTP 401 / 无效 token |
-| `1403` | 禁止 | 非群成员查历史、非成员发群消息、发私聊给自己 |
-| `1404` | 未找到 / 不支持 | 账号/群不存在、未实现动作（如 `set_group_kick`） |
+| `1403` | 禁止 | 非群成员查历史、非成员发群消息、发私聊给自己、群管权限不足、被禁言期间发送群消息 |
+| `1404` | 未找到 / 不支持 | 账号/群不存在、未实现动作（如 `set_group_leave`、`delete_msg`） |
 | `1500` | 内部错误 | 数据库/序列化异常；仍返回标准 envelope |
 
 未实现动作示例：
@@ -593,7 +776,7 @@ POST / HTTP/1.1
 Authorization: Bearer <token>
 Content-Type: application/json
 
-{"action":"set_group_kick","params":{"group_id":1,"user_id":2}}
+{"action":"set_group_leave","params":{"group_id":1}}
 ```
 
 ```http
@@ -605,7 +788,7 @@ Content-Type: application/json
 
 ---
 
-## 8. WebSocket 客户端示例
+## 9. WebSocket 客户端示例
 
 ```python
 import asyncio, json, websockets
@@ -624,7 +807,7 @@ asyncio.run(main())
 
 ---
 
-## 9. 能力声明
+## 10. 能力声明
 
 `/register` 的 `capabilities.actions` 严格等于已实现动作：
 
@@ -638,5 +821,9 @@ asyncio.run(main())
 - `get_friend_list`
 - `get_group_msg_history`
 - `get_friend_msg_history`
+- `set_group_kick`
+- `set_group_ban`
+- `set_group_admin`
+- `set_group_card`
 
-其他动作统一返回 1404。OB11 请求审批动作（`set_friend_add_request`、`set_group_add_request`）不在其中；审批使用本文第 6 节的自定义端点。
+其他动作统一返回 1404。OB11 请求审批动作（`set_friend_add_request`、`set_group_add_request`）不在其中；审批使用本文第 7 节的自定义端点。

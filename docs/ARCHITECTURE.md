@@ -4,7 +4,7 @@
 
 ### 目标
 
-1. 一个可运行的 OneBot 11 原型：账号注册、token 认证、HTTP 动作、WS 事件、私聊/群聊闭环、历史补拉、好友/加群审批。
+1. 一个可运行的 OneBot 11 原型：账号注册、token 认证、HTTP 动作、WS 事件、私聊/群聊闭环、历史补拉、好友/加群审批、群管理（踢人/禁言/管理员/名片）。
 2. 内部模型与协议解耦，后续增加 OneBot 12 只需新增转换适配器与 WS 首帧握手逻辑。
 3. 扇出永不阻塞；慢 WS 连接不得拖慢其他账号。
 4. 所有消息/通知/申请按接收账号独立填充 `self`（内部字段 `account_id`），避免推错人。
@@ -14,7 +14,7 @@
 ### 非目标
 
 - 生产级 IM 可靠性、跨实例一致性、消息删除/保留策略。
-- 反向 WS、CQ 码解析、文件上传、群管理动作、生产级人类 UI、SDK。
+- 反向 WS、CQ 码解析、文件上传、生产级人类 UI、SDK。
 - 服务端 TLS；TLS 由 Nginx 终止。
 
 ---
@@ -57,6 +57,7 @@ Domain event (message/notice/request)
   │    group message    → all group members (cache)
   │    private message  → both participants (cache)
   │    group notice     → current group members; leaver excluded
+  │    kick_me          → kicked account directly (no longer in group cache)
   │    friend request   → target account
   │    group request    → all owner/admin
   │
@@ -236,6 +237,47 @@ session_id   = group_id 的十进制字符串
 - 任何成员变更（入群审批、退群）立即 `invalidate_group`，不等待 TTL。
 - 缓存只用于 fanout 观众查询，不用于权限判定；动作权限直接查数据库（例如发群消息、查历史、审批），避免缓存陈旧造成越权。
 
+### 4.5 群管权限与审计事务
+
+群管动作不依赖缓存做权限判断。存储层在事务中：
+
+1. `SELECT ... FROM group_members WHERE group_id=$1 AND account_id IN (actor,target) FOR UPDATE`；
+2. 校验 actor/target 角色与动作矩阵；
+3. 执行变更（删成员、写 `group_bans`、更新 role/card）；
+4. 在同一事务写 `audit_logs`；
+5. 提交后使群成员缓存失效并扇出 notice。
+
+权限矩阵：
+
+| 动作 | owner | admin | member |
+|---|---|---|---|
+| kick | 任意非自己成员 | 仅 member | 禁止 |
+| ban | 任意非自己成员（含 admin） | 仅 member | 禁止 |
+| set admin | 允许（目标非 owner） | 禁止 | 禁止 |
+| set card | 任意成员（含自己） | 仅 member | 禁止 |
+
+- 被踢者先从 `group_members` 删除，再推 `group_decrease(kick)` 给剩余成员；`kick_me` 直接投递给被踢账号，即使其已不在成员缓存中。
+- 踢人/退群时删除对应 `group_bans`。
+- 设/撤管理员、改名片后立即失效群缓存，使后续消息 sender 信息与权限查询看到新状态。
+
+### 4.6 禁言持久化与发送拦截
+
+选择独立 `group_bans` 表，而不是在 `group_members` 上放 `banned_until`：
+
+- 主键 `(group_id, account_id)`，字段 `banned_until`、`operator_id`、`created_at`。
+- `duration=0` 删除该行；否则 upsert，`banned_until = now() + duration`。
+- 活跃禁言由查询 `banned_until > now()` 判定，使用数据库时钟；过期自动失效，不需要清理任务。
+- `send_group_msg` 与 `send_msg(message_type=group)` 在插入 messages 前调用 `active_group_ban`；命中则返回 1403，不写库、不扇出。
+- 服务重启不会清空禁言，因为状态完全在 PostgreSQL。
+
+### 4.7 群管 notice
+
+- `group_decrease`：`sub_type=kick` 给剩余成员；`sub_type=kick_me` 给被踢者。
+- `group_ban`：`sub_type=ban`/`lift_ban`，带 `duration`，推给所有当前成员（含被禁言者）。
+- `group_admin`：`sub_type=set`/`unset`，推给所有成员。
+- `group_card`：带 `card` 与 `old_card` 扩展，推给所有成员。
+- 所有 notice 沿用 per-receiver `account_id` 填充和 `try_send` 背压隔离。
+
 ---
 
 ## 5. 背压隔离
@@ -270,7 +312,7 @@ session_id   = group_id 的十进制字符串
   2. 提交后 `registry.kick_account(account_id)`；
   3. 旧 HTTP 下一次请求 401；旧 WS 收到取消并关闭。
 - 周期复核：每 60 秒查一次当前 hash/disabled，作为主动踢失效后的兜底。
-- 审计：`token_reset_audit(account_id, actor, action, reason, created_at)`；actor 为用户名或 `admin:<X-Admin-Actor>`。
+- 审计：`token_reset_audit(account_id, actor, action, reason, created_at)`；actor 为用户名或 `admin:<X-Admin-Actor>`。群管审计独立写入 `audit_logs`。
 
 ---
 
@@ -283,6 +325,8 @@ session_id   = group_id 的十进制字符串
 - HTTP body 限制 2MB；WS 入站消息/帧限制 64KB（WS 本来只推事件）。
 - Nginx 样例不记录 query，避免 token 进入访问日志。
 - CORS 为 permissive（为了单文件客户端 `file://` 可用）；API 无 cookie，token 仍是唯一凭证。生产应限制允许来源。
+- 群管权限只由群成员角色决定，不引入账号类型；每次动作都在事务内重新查询角色。
+- 群管审计与业务变更同事务提交，权限失败不写审计。
 - 没有 CSRF 风险面（不使用 cookie 会话）；不建议在不可信页面粘贴 token。
 - token 在 query 中传输的 WS 方式依赖 TLS（Nginx）保护；不建议明文公网部署。
 
@@ -307,3 +351,7 @@ session_id   = group_id 的十进制字符串
 5. `src/protocol/` 之外没有 `post_type` / `self_id` 等 OB11 事件字段（模型注释除外）。
 6. 存储 schema 的 `messages` 与游标列不引用协议版本字段。
 7. token 重置后旧哈希立即无法认证；审计与更新同事务。
+8. 群管权限只来自 `group_members.role`，并在写事务内用行锁校验；权限失败返回 1403。
+9. 活跃禁言完全由 `group_bans.banned_until` 持久化决定，过期即失效；被禁言者不能写群消息。
+10. 每个成功的群管操作都有同事务 `audit_logs` 行。
+11. 所有群管 notice 按接收账号独立序列化，`self_id` 正确。

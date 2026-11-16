@@ -56,6 +56,10 @@ pub struct EventExtras {
     pub request_comment: Option<String>,
     /// Used for group requests ("add") and notices ("approve"/"leave"/"kick").
     pub request_sub_type: Option<String>,
+    /// Group ban duration in seconds (0 means unban).
+    pub duration: Option<i64>,
+    /// Previous group card, for the `group_card` notice extension.
+    pub old_card: Option<String>,
 }
 
 /// Protocol-neutral event. Storage and fanout manipulate only this structure;

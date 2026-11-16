@@ -19,6 +19,7 @@ pub fn build_message_event(
     message: &StoredMessage,
     sender_name: &str,
     sender_role: Option<&str>,
+    sender_card: Option<&str>,
     group_name: Option<&str>,
 ) -> ChatEvent {
     let (event_type, detail_type) = (
@@ -47,7 +48,7 @@ pub fn build_message_event(
         message_seq: Some(message.message_seq),
         extras: EventExtras {
             nickname: Some(sender_name.to_owned()),
-            card: None,
+            card: sender_card.map(str::to_owned),
             role: sender_role.map(str::to_owned),
             group_name: group_name.map(str::to_owned),
             ..EventExtras::default()
@@ -70,11 +71,13 @@ pub async fn fanout_group_message(
         None => state.store.get_account(message.sender_id).await?.username,
     };
     let sender_role = sender.map(|m| m.role.as_str()).unwrap_or("member");
+    let sender_card = sender.map(|m| m.card.as_str());
     let group_name = state.store.get_group(group_id).await.ok().map(|g| g.name);
     let base = build_message_event(
         message,
         &sender_name,
         Some(sender_role),
+        sender_card,
         group_name.as_deref(),
     );
 
@@ -99,7 +102,7 @@ pub async fn fanout_private_message(
         .iter()
         .find(|a| a.id == sender_id)
         .ok_or_else(|| FanoutError::MissingAccount(sender_id))?;
-    let base = build_message_event(message, &sender.username, None, None);
+    let base = build_message_event(message, &sender.username, None, None, None);
 
     let mut recipients = vec![sender_id, peer_id];
     recipients.sort_unstable();
@@ -121,6 +124,43 @@ pub async fn fanout_private_message(
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GroupNoticeExtras {
+    pub duration: Option<i64>,
+    pub card: Option<String>,
+    pub old_card: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupNotice<'a> {
+    pub group_id: i64,
+    pub detail_type: &'a str,
+    pub operator_id: i64,
+    pub target_id: i64,
+    pub sub_type: Option<&'a str>,
+    pub extras: GroupNoticeExtras,
+}
+
+impl<'a> GroupNotice<'a> {
+    pub fn new(
+        group_id: i64,
+        detail_type: &'a str,
+        operator_id: i64,
+        target_id: i64,
+        sub_type: Option<&'a str>,
+        extras: GroupNoticeExtras,
+    ) -> Self {
+        Self {
+            group_id,
+            detail_type,
+            operator_id,
+            target_id,
+            sub_type,
+            extras,
+        }
+    }
+}
+
 /// Push a membership-change notice to current group members. Callers invalidate
 /// the group cache before calling this. `exclude` is used for group_decrease so
 /// the leaver does not receive their own departure notice.
@@ -133,29 +173,30 @@ pub async fn fanout_group_notice(
     sub_type: &str,
     exclude: &[i64],
 ) -> Result<(), FanoutError> {
-    let members = state.cache.group_members(group_id).await?;
-    let group = state.store.get_group(group_id).await?;
-    let base = ChatEvent {
-        event_id: new_event_id("notice"),
-        event_type: EventType::Notice,
-        detail_type: detail_type.to_owned(),
-        account_id: String::new(),
-        session_type: SessionType::Group,
-        session_id: Some(group_id.to_string()),
-        sender_id: Some(operator_id.to_string()),
-        content: Vec::new(),
-        timestamp: unix_seconds(Utc::now()),
-        raw: None,
-        message_id: None,
-        message_seq: None,
-        extras: EventExtras {
-            group_name: Some(group.name),
-            operator_id: Some(operator_id.to_string()),
-            target_id: Some(target_id.to_string()),
-            request_sub_type: Some(sub_type.to_owned()),
-            ..EventExtras::default()
-        },
-    };
+    fanout_group_notice_with_extras(
+        state,
+        GroupNotice::new(
+            group_id,
+            detail_type,
+            operator_id,
+            target_id,
+            Some(sub_type),
+            GroupNoticeExtras::default(),
+        ),
+        exclude,
+    )
+    .await
+}
+
+/// Fan out an extended group notice (ban/admin/card) to current members.
+pub async fn fanout_group_notice_with_extras(
+    state: &AppState,
+    notice: GroupNotice<'_>,
+    exclude: &[i64],
+) -> Result<(), FanoutError> {
+    let members = state.cache.group_members(notice.group_id).await?;
+    let group = state.store.get_group(notice.group_id).await?;
+    let base = build_group_notice_event(group.name, &notice);
 
     let excluded: HashSet<i64> = exclude.iter().copied().collect();
     for member in members.iter() {
@@ -166,6 +207,48 @@ pub async fn fanout_group_notice(
         dispatch(state, &account_from_member(member), &event);
     }
     Ok(())
+}
+
+/// Deliver one group notice to a specific account, even if it is no longer a
+/// member. Used for the `kick_me` notice sent to the kicked account.
+pub async fn fanout_group_notice_to_account(
+    state: &AppState,
+    account_id: i64,
+    notice: GroupNotice<'_>,
+) -> Result<(), FanoutError> {
+    let account = state.store.get_account(account_id).await?;
+    let group = state.store.get_group(notice.group_id).await?;
+    let base = build_group_notice_event(group.name, &notice);
+    let event = base.for_account(account.id_string());
+    dispatch(state, &account, &event);
+    Ok(())
+}
+
+fn build_group_notice_event(group_name: String, notice: &GroupNotice<'_>) -> ChatEvent {
+    ChatEvent {
+        event_id: new_event_id("notice"),
+        event_type: EventType::Notice,
+        detail_type: notice.detail_type.to_owned(),
+        account_id: String::new(),
+        session_type: SessionType::Group,
+        session_id: Some(notice.group_id.to_string()),
+        sender_id: Some(notice.operator_id.to_string()),
+        content: Vec::new(),
+        timestamp: unix_seconds(Utc::now()),
+        raw: None,
+        message_id: None,
+        message_seq: None,
+        extras: EventExtras {
+            group_name: Some(group_name),
+            operator_id: Some(notice.operator_id.to_string()),
+            target_id: Some(notice.target_id.to_string()),
+            request_sub_type: notice.sub_type.map(str::to_owned),
+            duration: notice.extras.duration,
+            card: notice.extras.card.clone(),
+            old_card: notice.extras.old_card.clone(),
+            ..EventExtras::default()
+        },
+    }
 }
 
 pub async fn fanout_friend_request(

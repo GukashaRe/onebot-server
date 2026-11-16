@@ -39,6 +39,7 @@ python scripts/e2e.py
 - `REGISTER_KEY`：必填，需与服务端配置一致
 - `ADMIN_KEY`：必填，需与服务端配置一致
 - `RUN_SLOW_TEST=0` 可跳过慢消费者测试
+- `E2E_STATE_FILE`：可选；把最后一组群管测试的账号/群/token 写入指定文件，用于重启后禁言验证（该文件含 token，勿提交）
 
 ## 2. 最近一次运行结果
 
@@ -53,8 +54,9 @@ python scripts/e2e.py
 [8] token reset revokes HTTP and kicks WS                6 PASS
 [9] slow WS does not block a fast WS                     4 PASS
 [10] group leave and permission checks                   7 PASS
+[11] group management actions, permissions, notices      63 PASS
 
-ALL 86 CHECKS PASSED
+ALL 149 CHECKS PASSED
 ```
 
 编译质量：
@@ -65,7 +67,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-本机结果：`cargo test` 共 11 个单元测试全部通过；`cargo clippy --all-targets -- -D warnings` 无 warning。
+本机结果：`cargo test` 共 14 个单元测试全部通过；`cargo clippy --all-targets -- -D warnings` 无 warning。
 
 ## 3. 单文件客户端 UI 验证
 
@@ -93,7 +95,7 @@ UI 测试使用临时账号，不依赖仓库内测试数据。
 | 4 | 私聊闭环：双方收到 private，self_id 各自账号 | e2e [2]：sender/receiver 事件 `self_id` 分别断言 | 通过 |
 | 5 | 群聊闭环：A/B/C 同群，A 发消息，B/C 收 group + 各自 self_id | e2e [5]：三端事件同时断言 | 通过 |
 | 6 | 群/私聊历史补拉，按 message_id 去重后无重复无遗漏 | e2e [6]：after_seq 分页逐页拉取、ID 唯一、seq 升序、与全量一致；断线期间群/私聊消息补拉 | 通过 |
-| 7 | 未实现动作返回标准“不支持”错误，不是 500 | e2e [7]：`set_group_kick` HTTP 200 / failed / 1404 / data=null / 仅三字段 | 通过 |
+| 7 | 未实现动作返回标准“不支持”错误，不是 500 | e2e [7]：`set_group_leave` HTTP 200 / failed / 1404 / data=null / 仅三字段 | 通过 |
 | 8 | 重置 token 后旧 token HTTP 401，旧 WS 被踢 | e2e [8]：自助重置 + 管理员重置，旧 token 401、旧 WS closed | 通过 |
 | 9 | 重复注册同一 username 返回 409 | e2e [1]：用大写用户名重复注册，返回 409 | 通过 |
 | 10 | 慢 WS 不阻塞其他连接推送 | e2e [9]：原始 WS 完成握手后不读；400 条 16KB 群消息；快连接全收；服务端记录 slow_disconnect；耗时 < 60s | 通过 |
@@ -102,6 +104,14 @@ UI 测试使用临时账号，不依赖仓库内测试数据。
 | 13 | 加群闭环 | e2e [4]：A 建群，B/C 申请 → A WS 收两条 group request（sub_type=add）→ 审批 → 成员收到 group_increase → get_group_list | 通过 |
 | 14 | 建群后创建者 owner，get_group_list 可查 | e2e [4]：`owner_id`、role=owner、get_group_list | 通过 |
 | 15 | 协议抽象验证 | 静态 grep：`src/` 中（除 `src/protocol/` 与注释）没有 `post_type/self_id/notice_type/request_type`；迁移中 messages/cursor 无协议字段 | 通过 |
+| 16 | 踢人权限矩阵、group_decrease(kick)/kick_me、被踢后不再收群消息 | e2e [11]：owner 踢 member；admin 踢 member；admin 踢 admin/owner → 1403；member → 1403；kick_me self_id；被踢后新群消息不再投递 | 通过 |
+| 17 | 禁言持久化：60 秒禁言阻止发送；重启仍生效；过期恢复 | e2e [11] 验证 admin 禁言 member 60s、send_group_msg/send_msg 1403、消息未落库；重启服务后再次发送仍 1403；手工把 `banned_until` 改到过去后发送成功并写入历史 | 通过 |
+| 18 | 禁言权限矩阵 | e2e [11]：owner 禁言 admin 成功；admin 禁言 owner → 1403；member 禁言任何人 → 1403；duration=0 解除并推 lift_ban | 通过 |
+| 19 | 设管理员与撤管理员、权限变化 | e2e [11]：owner 设置 member 为 admin → 通知 set；该账号成功踢 member；owner 撤销 → 通知 unset；其再调 set_group_admin → 1403 | 通过 |
+| 20 | 名片权限与 group_card | e2e [11]：owner 改 admin/自己成功；admin 改 member 成功；admin 改 owner → 1403；member → 1403；通知含 card/old_card；成员信息持久化 | 通过 |
+| 21 | 群管审计完整 | 数据库核对 `audit_logs`：kick/ban/admin/card 成功操作均有 actor_id/action/target_id/group_id/detail/created_at，缺失字段数为 0 | 通过 |
+| 22 | 其他未实现动作仍返回标准错误 | e2e [11]：`set_group_leave`、`delete_msg` → 200/failed/1404/data=null | 通过 |
+| 23 | 群管 notice per-account self_id | e2e [11]：group_admin/group_ban/group_card/group_decrease 在多个接收者上分别断言 self_id 等于自身账号 ID | 通过 |
 
 ## 5. 额外覆盖
 
@@ -120,7 +130,34 @@ e2e 还验证了：
 - `GET /requests` 返回待审批好友/入群申请及申请者用户名；
 - 私聊事件包含 `peer_id`，发送方回显可正确定位对端会话；
 - CORS 预检返回允许来源/方法/头，`file://` 客户端可正常注册并连接 WS；
-- 慢消费者记录在 `/health` 的 `slow_disconnects` 中。
+- 慢消费者记录在 `/health` 的 `slow_disconnects` 中；
+- 群管动作的成功审计行数：group_kick=3、group_ban=3（含一次 60s、一次 30s、一次 0s 解除）、group_admin=4、group_card=3；
+- 被禁言成员调用 `send_group_msg` 与 `send_msg` 均在落库前返回 1403；
+- 被踢成员不再收到群消息；
+- duration=0 的 `group_ban` 推 `lift_ban` 且 duration=0。
+
+### 禁言重启验证
+
+e2e 可通过 `E2E_STATE_FILE` 输出最后一组测试的群/账号/token 状态（文件含 token，请放在仓库外并及时删除）：
+
+```bash
+export E2E_STATE_FILE="$TEMP/onebot-e2e-state.json"
+python scripts/e2e.py
+```
+
+然后：
+
+1. 停掉并重启 Rust 服务；
+2. 使用 state 里的 `m3_token` 调 `send_group_msg`，应仍返回 1403；
+3. 执行：
+   ```sql
+   UPDATE group_bans
+   SET banned_until = now() - interval '1 second'
+   WHERE group_id = <state.group_id> AND account_id = <state.m3_account_id>;
+   ```
+4. 再次发送，应成功并出现在历史中。
+
+本机已按此步骤验证通过。
 
 ## 6. 数据库核对
 
@@ -133,10 +170,27 @@ SELECT count(*) accounts,
        bool_and(token_hash ~ '^[0-9a-f]{64}$') valid_shape
 FROM accounts;
 
--- 两次重置：自助 + 服管
+-- token 重置审计
 SELECT account_id, actor, action, reason, created_at
 FROM token_reset_audit
 ORDER BY id;
+
+-- 群管审计
+SELECT actor_id, action, target_type, target_id, group_id, detail, created_at
+FROM audit_logs
+ORDER BY id;
+
+-- 审计完整性
+SELECT count(*) FILTER (
+         WHERE actor_id IS NULL OR action IS NULL OR target_id IS NULL
+            OR group_id IS NULL OR created_at IS NULL
+       ) AS incomplete,
+       count(*) AS total
+FROM audit_logs;
+
+-- 持久化禁言
+SELECT group_id, account_id, banned_until, operator_id, created_at
+FROM group_bans;
 
 -- 会话内 message_seq 单调且无重复
 SELECT session_type, session_id,
@@ -151,9 +205,8 @@ GROUP BY 1, 2;
 
 ```text
 所有 accounts 行：all_sha256_hex=t, valid_shape=t
-token_reset_audit 中包含：
-  <self username>  self-service token reset
-  admin:e2e-operator  administrator token reset
+audit_logs 中 group 11: group_kick=3, group_ban=3, group_admin=4, group_card=3
+审计缺失字段：incomplete=0, total=13
 group/<id>: 403 条消息，min_seq=1，max_seq=403，distinct_seq=403
 private/<a>:<b>: 3 条消息，min_seq=1，max_seq=3，distinct_seq=3
 ```

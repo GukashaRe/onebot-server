@@ -24,6 +24,10 @@ const IMPLEMENTED_ACTIONS: &[&str] = &[
     "get_friend_list",
     "get_group_msg_history",
     "get_friend_msg_history",
+    "set_group_kick",
+    "set_group_ban",
+    "set_group_admin",
+    "set_group_card",
 ];
 
 pub struct Ob11Adapter;
@@ -181,6 +185,15 @@ impl ProtocolAdapter for Ob11Adapter {
                             .and_then(parse_id)
                             .map(|id| id.to_string()),
                         request_sub_type: sub_type,
+                        duration: object.get("duration").and_then(Value::as_i64),
+                        card: object
+                            .get("card")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        old_card: object
+                            .get("old_card")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                         ..EventExtras::default()
                     },
                 })
@@ -309,6 +322,26 @@ impl ProtocolAdapter for Ob11Adapter {
                 after_seq: optional_cursor(params, "after_seq")?,
                 limit: optional_limit(params)?,
             },
+            "set_group_kick" => InternalAction::SetGroupKick {
+                group_id: required_param_id(params, "group_id")?,
+                user_id: required_param_id(params, "user_id")?,
+                reject_add_request: optional_param_bool(params, "reject_add_request")?,
+            },
+            "set_group_ban" => InternalAction::SetGroupBan {
+                group_id: required_param_id(params, "group_id")?,
+                user_id: required_param_id(params, "user_id")?,
+                duration_seconds: required_param_duration(params, "duration")?,
+            },
+            "set_group_admin" => InternalAction::SetGroupAdmin {
+                group_id: required_param_id(params, "group_id")?,
+                user_id: required_param_id(params, "user_id")?,
+                enable: required_param_bool(params, "enable")?,
+            },
+            "set_group_card" => InternalAction::SetGroupCard {
+                group_id: required_param_id(params, "group_id")?,
+                user_id: required_param_id(params, "user_id")?,
+                card: required_param_string(params, "card")?,
+            },
             other => InternalAction::Unsupported {
                 name: other.to_owned(),
             },
@@ -428,6 +461,16 @@ fn serialize_notice_event(
     } else if let Some(sender_id) = &event.sender_id {
         object.insert("user_id".to_owned(), json_id_from_str(sender_id));
     }
+    if let Some(duration) = event.extras.duration {
+        object.insert("duration".to_owned(), json!(duration));
+    }
+    if let Some(card) = &event.extras.card {
+        object.insert("card".to_owned(), json!(card));
+    }
+    if let Some(old_card) = &event.extras.old_card {
+        // Prototype extension: useful for clients updating a local member cache.
+        object.insert("old_card".to_owned(), json!(old_card));
+    }
     Ok(Value::Object(object))
 }
 
@@ -507,6 +550,54 @@ fn optional_param_id(
             .map(Some)
             .ok_or_else(|| AdapterError::InvalidParameter(key.to_owned())),
     }
+}
+
+fn optional_param_bool(
+    params: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<bool>, AdapterError> {
+    match params.and_then(|p| p.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(AdapterError::InvalidParameter(format!(
+            "{key} must be a boolean"
+        ))),
+    }
+}
+
+fn required_param_bool(
+    params: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<bool, AdapterError> {
+    optional_param_bool(params, key)?.ok_or_else(|| AdapterError::InvalidParameter(key.to_owned()))
+}
+
+fn required_param_string(
+    params: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<String, AdapterError> {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AdapterError::InvalidParameter(format!("{key} must be a string")))
+}
+
+fn required_param_duration(
+    params: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<i64, AdapterError> {
+    let value = params
+        .and_then(|p| p.get(key))
+        .ok_or_else(|| AdapterError::InvalidParameter(key.to_owned()))?;
+    let duration = parse_id(value)
+        .ok_or_else(|| AdapterError::InvalidParameter(format!("{key} must be an integer")))?;
+    if duration < 0 {
+        return Err(AdapterError::InvalidParameter(format!(
+            "{key} must be zero or positive"
+        )));
+    }
+    Ok(duration)
 }
 
 fn required_param_message(
@@ -603,7 +694,7 @@ mod tests {
     fn unsupported_action_has_standard_failure_envelope() {
         let adapter = Ob11Adapter::new();
         let request = adapter
-            .deserialize_action(r#"{"action":"set_group_kick","params":{}}"#)
+            .deserialize_action(r#"{"action":"set_group_leave","params":{}}"#)
             .unwrap();
         assert!(matches!(request.action, InternalAction::Unsupported { .. }));
 
@@ -615,6 +706,135 @@ mod tests {
         assert_eq!(value["retcode"], 1404);
         assert_eq!(value["data"], Value::Null);
         assert_eq!(value.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn group_management_actions_are_parsed_and_capabilities_updated() {
+        let adapter = Ob11Adapter::new();
+        let kick = adapter
+            .deserialize_action(
+                r#"{"action":"set_group_kick","params":{"group_id":"1","user_id":2,"reject_add_request":true}}"#,
+            )
+            .unwrap();
+        match kick.action {
+            InternalAction::SetGroupKick {
+                group_id,
+                user_id,
+                reject_add_request,
+            } => {
+                assert_eq!(group_id, 1);
+                assert_eq!(user_id, 2);
+                assert_eq!(reject_add_request, Some(true));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let ban = adapter
+            .deserialize_action(
+                r#"{"action":"set_group_ban","params":{"group_id":1,"user_id":2,"duration":60}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            ban.action,
+            InternalAction::SetGroupBan {
+                duration_seconds: 60,
+                ..
+            }
+        ));
+
+        let admin = adapter
+            .deserialize_action(
+                r#"{"action":"set_group_admin","params":{"group_id":1,"user_id":2,"enable":true}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            admin.action,
+            InternalAction::SetGroupAdmin { enable: true, .. }
+        ));
+
+        let card = adapter
+            .deserialize_action(
+                r#"{"action":"set_group_card","params":{"group_id":1,"user_id":2,"card":"新名片"}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            card.action,
+            InternalAction::SetGroupCard { ref card, .. } if card == "新名片"
+        ));
+
+        let mapping = adapter.action_mapping();
+        for action in [
+            "set_group_kick",
+            "set_group_ban",
+            "set_group_admin",
+            "set_group_card",
+        ] {
+            assert!(mapping.implemented_actions.contains(&action));
+        }
+    }
+
+    #[test]
+    fn negative_ban_duration_is_rejected() {
+        let adapter = Ob11Adapter::new();
+        let error = adapter
+            .deserialize_action(
+                r#"{"action":"set_group_ban","params":{"group_id":1,"user_id":2,"duration":-1}}"#,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("zero or positive"));
+    }
+
+    #[test]
+    fn group_management_notices_render_standard_fields_per_account() {
+        let adapter = Ob11Adapter::new();
+        let notice = ChatEvent {
+            event_id: "notice:1".to_owned(),
+            event_type: EventType::Notice,
+            detail_type: "group_ban".to_owned(),
+            account_id: "3".to_owned(),
+            session_type: SessionType::Group,
+            session_id: Some("10".to_owned()),
+            sender_id: Some("1".to_owned()),
+            content: Vec::new(),
+            timestamp: 1_700_000_000.0,
+            raw: None,
+            message_id: None,
+            message_seq: None,
+            extras: EventExtras {
+                operator_id: Some("1".to_owned()),
+                target_id: Some("2".to_owned()),
+                request_sub_type: Some("ban".to_owned()),
+                duration: Some(60),
+                ..EventExtras::default()
+            },
+        };
+        let body = adapter.serialize_event(&notice, &account(3)).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["self_id"], 3);
+        assert_eq!(value["notice_type"], "group_ban");
+        assert_eq!(value["sub_type"], "ban");
+        assert_eq!(value["duration"], 60);
+        assert_eq!(value["group_id"], 10);
+        assert_eq!(value["user_id"], 2);
+        assert_eq!(value["operator_id"], 1);
+
+        let card_notice = ChatEvent {
+            detail_type: "group_card".to_owned(),
+            extras: EventExtras {
+                operator_id: Some("1".to_owned()),
+                target_id: Some("2".to_owned()),
+                card: Some("".to_owned()),
+                old_card: Some("old".to_owned()),
+                ..EventExtras::default()
+            },
+            ..notice
+        };
+        let body = adapter.serialize_event(&card_notice, &account(3)).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["notice_type"], "group_card");
+        assert_eq!(value["card"], "");
+        assert_eq!(value["old_card"], "old");
+        assert_eq!(value["self_id"], 3);
     }
 
     #[test]

@@ -7,6 +7,7 @@ Environment:
   REGISTER_KEY     required; must match the server
   ADMIN_KEY        required; must match the server
   RUN_SLOW_TEST    default 1; set 0 to skip the backpressure test
+  E2E_STATE_FILE   optional path to write test fixture tokens/group for restart checks
 """
 
 from __future__ import annotations
@@ -87,6 +88,28 @@ def assert_action_ok(token: str, name: str, params: dict) -> dict:
     check(status == 200 and payload.get("status") == "ok" and payload.get("retcode") == 0,
           f"action {name} succeeds through HTTP")
     return payload["data"]
+
+
+def expect_action_retcode(token: str, name: str, params: dict, retcode: int, label: str) -> dict:
+    status, payload = action(token, name, params)
+    check(status == 200 and payload.get("status") == "failed" and payload.get("retcode") == retcode,
+          label)
+    return payload
+
+
+def notice_event(notice_type: str, sub_type: str | None = None,
+                 user_id: int | None = None, group_id: int | None = None):
+    def predicate(event: dict) -> bool:
+        if event.get("post_type") != "notice" or event.get("notice_type") != notice_type:
+            return False
+        if sub_type is not None and event.get("sub_type") != sub_type:
+            return False
+        if user_id is not None and event.get("user_id") != user_id:
+            return False
+        if group_id is not None and event.get("group_id") != group_id:
+            return False
+        return True
+    return predicate
 
 
 class WSClient:
@@ -469,7 +492,7 @@ async def main() -> None:
           "private history catch-up is exact by message_seq")
 
     print("[7] unsupported action follows OB11 error shape")
-    status, unsupported = action(alice["token"], "set_group_kick", {"group_id": group_id, "user_id": bob["account_id"]})
+    status, unsupported = action(alice["token"], "set_group_leave", {"group_id": group_id})
     check(status == 200, "unsupported action is HTTP 200, not 500")
     check(unsupported.get("status") == "failed" and unsupported.get("retcode") == 1404,
           "unsupported action uses retcode 1404")
@@ -588,6 +611,245 @@ async def main() -> None:
     await a_ws.close()
     await b_ws.close()
     await c_ws.close()
+
+    print("[11] group management actions, permissions, notices, bans")
+    owner2 = register(f"owner2_{SUFFIX}")
+    admin2 = register(f"admin2_{SUFFIX}")
+    m1 = register(f"m1_{SUFFIX}")
+    m2 = register(f"m2_{SUFFIX}")
+    m3 = register(f"m3_{SUFFIX}")
+    m4 = register(f"m4_{SUFFIX}")
+    m5 = register(f"m5_{SUFFIX}")
+    status, group2 = http("POST", "/groups", {"name": f"Mgmt {SUFFIX}"}, owner2["token"])
+    check(status == 200, "group management fixture group created")
+    gid = group2["group_id"]
+    for member in (admin2, m1, m2, m3, m4, m5):
+        status, join_payload = http("POST", f"/groups/{gid}/join", {}, member["token"])
+        check(status == 200, f"{member['username']} joins management group")
+        status, _ = http(
+            "POST",
+            f"/groups/{gid}/members/approve",
+            {"request_id": join_payload["request_id"], "approve": True},
+            owner2["token"],
+        )
+        check(status == 200, f"{member['username']} is approved into management group")
+
+    mgmt_clients = {
+        name: await WSClient.connect(name, account["token"])
+        for name, account in [
+            ("owner2", owner2),
+            ("admin2", admin2),
+            ("m1", m1),
+            ("m2", m2),
+            ("m3", m3),
+            ("m4", m4),
+            ("m5", m5),
+        ]
+    }
+
+    # ---- set_group_admin set / admin kick member / kick_me / removed fanout
+    assert_action_ok(owner2["token"], "set_group_admin",
+                     {"group_id": gid, "user_id": admin2["account_id"], "enable": True})
+    set_admin_notice = await mgmt_clients["admin2"].wait(
+        notice_event("group_admin", "set", admin2["account_id"], gid)
+    )
+    check(set_admin_notice["self_id"] == admin2["account_id"]
+          and set_admin_notice["operator_id"] == owner2["account_id"],
+          "group_admin set notice has per-account self_id and correct operator")
+    await mgmt_clients["m2"].wait(notice_event("group_admin", "set", admin2["account_id"], gid))
+    check(True, "group_admin set notice reaches other members")
+
+    expect_action_retcode(owner2["token"], "set_group_kick",
+                          {"group_id": gid, "user_id": owner2["account_id"]},
+                          1403, "owner cannot kick themselves")
+
+    assert_action_ok(owner2["token"], "set_group_kick",
+                     {"group_id": gid, "user_id": m4["account_id"], "reject_add_request": True})
+    m4_kick_me = await mgmt_clients["m4"].wait(
+        notice_event("group_decrease", "kick_me", m4["account_id"], gid)
+    )
+    check(m4_kick_me["self_id"] == m4["account_id"]
+          and m4_kick_me["operator_id"] == owner2["account_id"],
+          "owner kick: target receives kick_me with own self_id")
+    kick_notice_m2 = await mgmt_clients["m2"].wait(
+        notice_event("group_decrease", "kick", m4["account_id"], gid)
+    )
+    check(kick_notice_m2["self_id"] == m2["account_id"],
+          "owner kick: remaining member receives group_decrease(kick) with own self_id")
+
+    assert_action_ok(admin2["token"], "set_group_kick",
+                     {"group_id": gid, "user_id": m1["account_id"]})
+    m1_kick_me = await mgmt_clients["m1"].wait(
+        notice_event("group_decrease", "kick_me", m1["account_id"], gid)
+    )
+    check(m1_kick_me["self_id"] == m1["account_id"],
+          "admin kick: kicked member receives kick_me")
+    await mgmt_clients["m2"].wait(
+        notice_event("group_decrease", "kick", m1["account_id"], gid)
+    )
+    post_kick_text = f"post-kick-{SUFFIX}"
+    post_kick_mid = assert_action_ok(
+        owner2["token"], "send_group_msg",
+        {"group_id": gid, "message": [{"type": "text", "data": {"text": post_kick_text}}]},
+    )["message_id"]
+    await mgmt_clients["m2"].wait(msg_event(message_id=post_kick_mid))
+    try:
+        await mgmt_clients["m1"].wait(msg_event(message_id=post_kick_mid), timeout=1.0)
+        kicked_received = True
+    except TimeoutError:
+        kicked_received = False
+    check(not kicked_received, "kicked member no longer receives group messages")
+
+    # ---- admin vs admin / admin vs owner / member attempts
+    assert_action_ok(owner2["token"], "set_group_admin",
+                     {"group_id": gid, "user_id": m2["account_id"], "enable": True})
+    await mgmt_clients["m2"].wait(notice_event("group_admin", "set", m2["account_id"], gid))
+    expect_action_retcode(admin2["token"], "set_group_admin",
+                          {"group_id": gid, "user_id": m2["account_id"], "enable": True},
+                          1403, "admin cannot set or unset admins")
+    expect_action_retcode(admin2["token"], "set_group_kick",
+                          {"group_id": gid, "user_id": m2["account_id"]},
+                          1403, "admin cannot kick another admin")
+    expect_action_retcode(admin2["token"], "set_group_kick",
+                          {"group_id": gid, "user_id": owner2["account_id"]},
+                          1403, "admin cannot kick the owner")
+    expect_action_retcode(m3["token"], "set_group_kick",
+                          {"group_id": gid, "user_id": m2["account_id"]},
+                          1403, "member cannot kick anyone")
+
+    # ---- set_group_admin by owner, promoted member kicks a member, then unset
+    assert_action_ok(owner2["token"], "set_group_admin",
+                     {"group_id": gid, "user_id": m3["account_id"], "enable": True})
+    m3_admin_notice = await mgmt_clients["m3"].wait(
+        notice_event("group_admin", "set", m3["account_id"], gid)
+    )
+    check(m3_admin_notice["self_id"] == m3["account_id"],
+          "promoted member receives group_admin(set)")
+    assert_action_ok(m3["token"], "set_group_kick",
+                     {"group_id": gid, "user_id": m5["account_id"]})
+    await mgmt_clients["m5"].wait(
+        notice_event("group_decrease", "kick_me", m5["account_id"], gid)
+    )
+    check(True, "promoted admin can kick a regular member")
+    assert_action_ok(owner2["token"], "set_group_admin",
+                     {"group_id": gid, "user_id": m3["account_id"], "enable": False})
+    m3_unset_notice = await mgmt_clients["m3"].wait(
+        notice_event("group_admin", "unset", m3["account_id"], gid)
+    )
+    check(m3_unset_notice["sub_type"] == "unset",
+          "demoted member receives group_admin(unset)")
+    expect_action_retcode(m3["token"], "set_group_admin",
+                          {"group_id": gid, "user_id": m2["account_id"], "enable": True},
+                          1403, "non-owner cannot set admin")
+
+    # ---- bans: permission matrix, message blocking, persistent row
+    assert_action_ok(admin2["token"], "set_group_ban",
+                     {"group_id": gid, "user_id": m3["account_id"], "duration": 60})
+    ban_notice_m3 = await mgmt_clients["m3"].wait(
+        notice_event("group_ban", "ban", m3["account_id"], gid)
+    )
+    check(ban_notice_m3["self_id"] == m3["account_id"]
+          and ban_notice_m3.get("duration") == 60
+          and ban_notice_m3["operator_id"] == admin2["account_id"],
+          "group_ban notice includes duration/operator and target self_id")
+    ban_notice_m2 = await mgmt_clients["m2"].wait(
+        notice_event("group_ban", "ban", m3["account_id"], gid)
+    )
+    check(ban_notice_m2["self_id"] == m2["account_id"],
+          "group_ban notice uses per-receiver self_id")
+    history_before_ban = assert_action_ok(
+        owner2["token"], "get_group_msg_history", {"group_id": gid, "limit": 100}
+    )["messages"]
+    expect_action_retcode(m3["token"], "send_group_msg",
+                          {"group_id": gid, "message": [{"type": "text", "data": {"text": "banned"}}]},
+                          1403, "banned member cannot send_group_msg")
+    expect_action_retcode(m3["token"], "send_msg",
+                          {"message_type": "group", "group_id": gid,
+                           "message": [{"type": "text", "data": {"text": "banned"}}]},
+                          1403, "banned member cannot send_msg to the group")
+    history_after_ban = assert_action_ok(
+        owner2["token"], "get_group_msg_history", {"group_id": gid, "limit": 100}
+    )["messages"]
+    check([m["message_id"] for m in history_before_ban]
+          == [m["message_id"] for m in history_after_ban],
+          "banned sends are rejected before writing messages")
+
+    expect_action_retcode(admin2["token"], "set_group_ban",
+                          {"group_id": gid, "user_id": owner2["account_id"], "duration": 60},
+                          1403, "admin cannot ban the owner")
+    expect_action_retcode(m3["token"], "set_group_ban",
+                          {"group_id": gid, "user_id": m2["account_id"], "duration": 60},
+                          1403, "member cannot ban anyone")
+    assert_action_ok(owner2["token"], "set_group_ban",
+                     {"group_id": gid, "user_id": admin2["account_id"], "duration": 30})
+    await mgmt_clients["admin2"].wait(
+        notice_event("group_ban", "ban", admin2["account_id"], gid)
+    )
+    check(True, "owner can ban an admin")
+    assert_action_ok(owner2["token"], "set_group_ban",
+                     {"group_id": gid, "user_id": admin2["account_id"], "duration": 0})
+    unban_notice = await mgmt_clients["admin2"].wait(
+        notice_event("group_ban", "lift_ban", admin2["account_id"], gid)
+    )
+    check(unban_notice.get("duration") == 0,
+          "duration=0 produces lift_ban notice with duration 0")
+
+    # ---- group card permissions and notices
+    assert_action_ok(owner2["token"], "set_group_card",
+                     {"group_id": gid, "user_id": admin2["account_id"], "card": "Boss"})
+    card_notice = await mgmt_clients["admin2"].wait(
+        notice_event("group_card", None, admin2["account_id"], gid)
+    )
+    check(card_notice["self_id"] == admin2["account_id"]
+          and card_notice.get("card") == "Boss"
+          and card_notice.get("old_card") == "",
+          "owner card change notice has new/old card and target self_id")
+    assert_action_ok(admin2["token"], "set_group_card",
+                     {"group_id": gid, "user_id": m3["account_id"], "card": "Helper"})
+    await mgmt_clients["m3"].wait(
+        notice_event("group_card", None, m3["account_id"], gid)
+    )
+    check(True, "admin can change a regular member's card")
+    expect_action_retcode(admin2["token"], "set_group_card",
+                          {"group_id": gid, "user_id": owner2["account_id"], "card": "Nope"},
+                          1403, "admin cannot change the owner's card")
+    expect_action_retcode(m3["token"], "set_group_card",
+                          {"group_id": gid, "user_id": m2["account_id"], "card": "Nope"},
+                          1403, "member cannot change any card")
+    assert_action_ok(owner2["token"], "set_group_card",
+                     {"group_id": gid, "user_id": owner2["account_id"], "card": "OwnerCard"})
+    await mgmt_clients["owner2"].wait(
+        notice_event("group_card", None, owner2["account_id"], gid)
+    )
+    check(True, "owner can change their own group card")
+    admin_info = assert_action_ok(owner2["token"], "get_group_member_info",
+                                  {"group_id": gid, "user_id": admin2["account_id"]})
+    owner_info = assert_action_ok(owner2["token"], "get_group_member_info",
+                                  {"group_id": gid, "user_id": owner2["account_id"]})
+    check(admin_info["card"] == "Boss" and owner_info["card"] == "OwnerCard",
+          "group card changes are persisted and visible via member info")
+
+    # ---- unsupported group-management adjacent actions remain 1404
+    for unsupported_name in ("set_group_leave", "delete_msg"):
+        status, payload = action(owner2["token"], unsupported_name, {})
+        check(status == 200 and payload.get("status") == "failed"
+              and payload.get("retcode") == 1404,
+              f"{unsupported_name} returns standard unsupported error")
+
+    state_path = os.environ.get("E2E_STATE_FILE")
+    if state_path:
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "base": BASE,
+                "group_id": gid,
+                "m3_token": m3["token"],
+                "m3_account_id": m3["account_id"],
+                "owner_token": owner2["token"],
+                "owner_account_id": owner2["account_id"],
+            }, handle)
+
+    for client in mgmt_clients.values():
+        await client.close()
 
     print(f"\nALL {len(PASSED)} CHECKS PASSED")
 
